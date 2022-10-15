@@ -6,6 +6,7 @@ const corsOptions = require("./config/corsOptions");
 const errorHandler = require("./middleware/errorHandler");
 const SessionStore = require("./model/SessionStore");
 const { v4: uuid } = require("uuid");
+const MessageStore = require("./model/messageStore");
 
 app.use(cors(corsOptions));
 app.use(express.json());
@@ -22,24 +23,20 @@ const io = socket(server, {
 	},
 });
 
-// create session store
+// stores
 const sessionStore = new SessionStore();
+const messageStore = new MessageStore();
 
 io.use((socket, next) => {
-	// console.log("all session", sessionStore.getAllSessions());
-
 	const sessionId = socket.handshake.auth?.sessionId;
 	if (sessionId) {
 		// find existing session
 		const session = sessionStore.findSession(sessionId);
-		// console.log("found session", { session });
 
 		if (session) {
 			socket.sessionId = sessionId;
 			socket.userId = session.userId;
 			socket.username = session.username;
-
-			console.log("found session return");
 
 			return next();
 		}
@@ -48,7 +45,6 @@ io.use((socket, next) => {
 	const username = socket.handshake.auth?.username;
 
 	if (!username) {
-		// console.log("invalid username");
 		return next(new Error("Invalid username!"));
 	}
 
@@ -60,7 +56,6 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
-	console.log({ userId: socket.userId, username: socket.username });
 	// save session
 	sessionStore.saveSession(socket.sessionId, {
 		userId: socket.userId,
@@ -78,19 +73,34 @@ io.on("connection", (socket) => {
 	// join the 'userId' room
 	socket.join(socket.userId);
 
-	// setting users
+	// adding initial messages
+	const messagesPerUser = new Map();
+	messageStore.findMessagesPerUser(socket.userId).forEach((message) => {
+		const { userId: to, from } = message;
+
+		const user = socket.userId === from ? to : from;
+
+		if (messagesPerUser.has(user)) {
+			messagesPerUser.get(user).push(message);
+		} else {
+			messagesPerUser.set(user, [message]);
+		}
+	});
+
+	// adding initial users
 	const users = [];
 	sessionStore.getAllSessions().forEach((session) => {
 		users.push({
 			userId: session.userId,
 			username: session.username,
 			active: session.active,
+			messages: messagesPerUser.get(session.userId) || [],
 		});
 	});
 
 	console.log(`New user ${socket.userId} connected!`);
 
-	// update users list
+	// users list
 	socket.emit("user_list", users);
 
 	// notify other users
@@ -98,12 +108,15 @@ io.on("connection", (socket) => {
 		userId: socket.userId,
 		username: socket.username,
 		active: true,
+		messages: [],
 	});
 
 	socket.on("send_msg", (msg) => {
-		// console.log(msg);
 		// message to both recipient and sender
 		socket.to(msg.from).to(msg.userId).emit("recieve_msg", msg);
+
+		// save message
+		messageStore.saveMessage(msg);
 	});
 
 	// remove users on disconnect
@@ -113,7 +126,6 @@ io.on("connection", (socket) => {
 
 		// check all the sockets are disconnected
 		const isDisconnected = matchingSockets.size === 0;
-		console.log({ userId: socket.userId, isDisconnected });
 
 		if (isDisconnected) {
 			// notify other users
